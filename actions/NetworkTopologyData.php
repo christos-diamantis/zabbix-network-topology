@@ -16,6 +16,8 @@ use Modules\NetworkTopology\Topology\ProblemLoader;
 use Modules\NetworkTopology\Topology\TopoDiff;
 use CControllerResponseFatal;
 use API;
+use Manager;
+use Throwable;
 
 class NetworkTopologyData extends NetworkTopologyController {
 
@@ -154,6 +156,9 @@ class NetworkTopologyData extends NetworkTopologyController {
      * haelt, statt einer, der etwas verspricht.
      */
     private const LASTVALUE_RUECKFALL_CHUNK = 200;
+
+    /** Value of ZBX_HISTORY_SOURCE_SQL; a literal in case the constant is missing. */
+    private const HISTORY_SOURCE_SQL = 'sql';
 
     /**
      * Host+hops mode: upper bound for the hop distance. Mirrors MAX_HOPS in
@@ -1463,6 +1468,31 @@ class NetworkTopologyData extends NetworkTopologyController {
             }));
             if (empty($type_itemids)) continue;
 
+            // ── Non-SQL history: through Zabbix's own HistoryManager ──────
+            // When the server writes this value type to ClickHouse (Zabbix 8
+            // HistoryProvider) or Elasticsearch, the SQL table stays EMPTY:
+            // the direct path below would find nothing, every item would
+            // arrive with lastvalue=null and LldpEdgeBuilder would not build
+            // a single edge. That is exactly what an 8.0.0rc1 lab with
+            // ClickHouse showed: nodes without links while the API reported
+            // fresh values. The manager knows the provider configuration from
+            // zabbix.conf.php; ClickHouse fetches the last value per item in
+            // one query (LIMIT 1 BY itemid), so no window or fallback is
+            // needed there.
+            if (self::historySource($vtype) !== self::HISTORY_SOURCE_SQL) {
+                $ext_items = [];
+                foreach ($type_itemids as $iid) {
+                    $ext_items[] = ['itemid' => (string) $iid, 'value_type' => $vtype];
+                }
+                foreach (Manager::History()->getLastValues($ext_items, 1) as $iid => $rows) {
+                    if (!$rows) continue;
+                    $iid = (int) $iid;
+                    $last_values[$iid] = $rows[0]['value'];
+                    $last_clocks[$iid] = (int) $rows[0]['clock'];
+                }
+                continue;
+            }
+
             // ── Stufe 1: ein Scan ueber das Zeitfenster ───────────────────
             $offen = [];
             foreach (array_chunk($type_itemids, self::LASTVALUE_FENSTER_CHUNK) as $chunk) {
@@ -1520,6 +1550,24 @@ class NetworkTopologyData extends NetworkTopologyController {
         }
 
         return ['values' => $last_values, 'clocks' => $last_clocks];
+    }
+
+    /**
+     * Where the server stores a value type: 'sql', 'elasticsearch'/'elastic'
+     * or 'clickhouse'. Falls back to 'sql' when the HistoryManager cannot
+     * answer — that is the path every version up to 5.5.27 always took.
+     */
+    private static function historySource(int $vtype): string {
+        try {
+            $history = Manager::History();
+            if (method_exists($history, 'getDataSourceType')) {
+                return (string) $history->getDataSourceType($vtype);
+            }
+        }
+        catch (Throwable $e) {
+            // deliberately silent: without an answer we stay on the SQL path
+        }
+        return self::HISTORY_SOURCE_SQL;
     }
 
     /**
